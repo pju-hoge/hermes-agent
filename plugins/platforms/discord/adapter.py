@@ -708,12 +708,18 @@ class VoiceReceiver:
     MIN_SPEECH_DURATION = 0.5  # minimum seconds to process (skip noise)
     SAMPLE_RATE = 48000        # Discord native rate
     CHANNELS = 2               # Discord sends stereo
+    # RMS gate: ignore decoded audio quieter than this (environmental noise).
+    # 0 = disabled (old behavior). Tune via env DISCORD_VOICE_RMS_THRESHOLD.
+    DEFAULT_RMS_THRESHOLD = float(
+        os.getenv("DISCORD_VOICE_RMS_THRESHOLD", "0")
+    )
     REKEY_FAILURE_STREAK = 25  # consecutive NaCl failures → re-resolve creds
 
     def __init__(self, voice_client, allowed_user_ids: set | None = None):
         self._vc = voice_client
         self._allowed_user_ids = allowed_user_ids or set()
         self._running = False
+        self._rms_threshold = self.DEFAULT_RMS_THRESHOLD
 
         # Decryption state, kept as ONE tuple (secret_key, dave_session,
         # dave_protocol_version, dave_downgraded) so the receive thread
@@ -1092,6 +1098,18 @@ class VoiceReceiver:
             if ssrc not in self._decoders:
                 self._decoders[ssrc] = discord.opus.Decoder()
             pcm = self._decoders[ssrc].decode(decrypted)
+            # RMS noise gate: ignore decoded audio quieter than the threshold.
+            # Background noise (keyboard, fan, mic hiss) passes through Opus
+            # decode and would otherwise be buffered as "speech". When
+            # _rms_threshold is 0 the gate is disabled (original behavior).
+            if self._rms_threshold > 0:
+                try:
+                    import audioop
+                    rms = audioop.rms(pcm, 2)
+                    if rms < self._rms_threshold:
+                        return  # treat quiet audio as silence; do not buffer
+                except Exception:
+                    pass
             self._decode_ok += 1
             with self._lock:
                 self._buffers[ssrc].extend(pcm)
